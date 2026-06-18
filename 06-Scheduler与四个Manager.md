@@ -98,7 +98,7 @@ class DecodeManager:
 
     def schedule_next_batch(self):
         if not self.runnable: return None
-        return Batch(reqs=list(self.running_reqs), phase="decode")
+        return Batch(reqs=sorted(self.running_reqs, key=lambda req: req.uid), phase="decode")
 
     @property
     def inflight_tokens(self):
@@ -107,6 +107,16 @@ class DecodeManager:
 ```
 
 几个值得注意的点：
+
+### 为什么 `schedule_next_batch` 要按 `uid` 排序
+
+`running_reqs` 是一个 **`Set[Req]`**，而 Python set 的迭代顺序是由对象 hash 决定的、**进程间不保证一致**。在 TP > 1 时，每个 rank 是一个独立进程、各自维护自己的 `DecodeManager`；如果直接 `list(self.running_reqs)`，不同 rank 排出来的 decode batch 里请求顺序可能不同。
+
+这会出问题：batch 里请求的排列顺序决定了它们在 KV page table、attention metadata、采样输出里的**行号**。各 rank 顺序不一致 → 同一个 token 在不同 rank 上被算进了不同的 slot → all-reduce/all-gather 时对不齐 → 输出错乱甚至 hang。
+
+修复（[#113](https://github.com/sgl-project/mini-sglang/pull/113)）很简单：[`decode.py:35`](../../python/minisgl/scheduler/decode.py) 用 `sorted(self.running_reqs, key=lambda req: req.uid)` 把顺序钉死。`uid` 全局唯一且各 rank 一致（rank 0 广播 `UserMsg` 时带的就是同一个 uid），于是所有 rank 排出来的 decode batch 顺序必然相同。prefill batch 不需要这层处理，因为它是顺序遍历 `pending_list`（FIFO list，本身有序）构造的。
+
+> 小结：**凡是跨 TP rank 必须逐字节一致的结构，都不能依赖 set/dict 的迭代顺序**——要么用有序容器，要么显式 sort by 一个各 rank 一致的 key。这是分布式推理里很典型的一类坑。
 
 ### `filter_reqs` 是怎么被调用的
 
